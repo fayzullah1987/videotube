@@ -5,9 +5,9 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
 const mongoose = require('mongoose');
-const Minio = require('minio');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const cors = require('cors');
-const { Readable } = require('stream');
 
 // Set FFmpeg paths
 const ffmpegPath = require('ffmpeg-static');
@@ -50,45 +50,18 @@ const videoSchema = new mongoose.Schema({
 
 const Video = mongoose.model('Video', videoSchema);
 
-// MinIO Client
-const minioClient = new Minio.Client({
-  endPoint: process.env.MINIO_ENDPOINT || 'localhost',
-  port: parseInt(process.env.MINIO_PORT) || 9000,
-  useSSL: process.env.MINIO_USE_SSL === 'true',
-  accessKey: process.env.MINIO_ACCESS_KEY || 'admin',
-  secretKey: process.env.MINIO_SECRET_KEY || 'password123'
+// Cloudflare R2 Client (S3-compatible)
+const r2Client = new S3Client({
+  region: 'auto',
+  endpoint: process.env.R2_ENDPOINT, // https://xxxxx.r2.cloudflarestorage.com
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+  }
 });
 
-const BUCKET_NAME = process.env.MINIO_BUCKET || 'videotube';
-
-// Ensure bucket exists
-async function ensureBucket() {
-  try {
-    const exists = await minioClient.bucketExists(BUCKET_NAME);
-    if (!exists) {
-      await minioClient.makeBucket(BUCKET_NAME, 'us-east-1');
-      console.log(`✅ Created bucket: ${BUCKET_NAME}`);
-
-      // Set public read policy
-      const policy = {
-        Version: '2012-10-17',
-        Statement: [
-          {
-            Effect: 'Allow',
-            Principal: { AWS: ['*'] },
-            Action: ['s3:GetObject'],
-            Resource: [`arn:aws:s3:::${BUCKET_NAME}/*`]
-          }
-        ]
-      };
-      await minioClient.setBucketPolicy(BUCKET_NAME, JSON.stringify(policy));
-    }
-  } catch (err) {
-    console.error('Bucket setup error:', err);
-  }
-}
-
-ensureBucket();
+const BUCKET_NAME = process.env.R2_BUCKET || 'videotube';
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL; // https://pub-xxxxx.r2.dev
 
 // Multer for temporary file storage
 const upload = multer({
@@ -125,29 +98,39 @@ function generateThumbnails(videoPath, outputDir, count = 10) {
   });
 }
 
-// Upload file to MinIO
-async function uploadToMinio(filePath, objectName, contentType) {
-  const fileStream = fs.createReadStream(filePath);
-  const stats = fs.statSync(filePath);
+// Upload file to R2
+async function uploadToR2(filePath, key, contentType) {
+  const fileContent = fs.readFileSync(filePath);
 
-  await minioClient.putObject(BUCKET_NAME, objectName, fileStream, stats.size, {
-    'Content-Type': contentType
+  const command = new PutObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: key,
+    Body: fileContent,
+    ContentType: contentType
   });
+
+  await r2Client.send(command);
 }
 
-// Get MinIO URL
-function getMinioUrl(objectName) {
-  const endpoint = process.env.MINIO_ENDPOINT || 'localhost';
-  const port = process.env.MINIO_PORT || 9000;
-  const useSSL = process.env.MINIO_USE_SSL === 'true';
-  const protocol = useSSL ? 'https' : 'http';
-
-  // For production, use public URL if available
-  if (process.env.MINIO_PUBLIC_URL) {
-    return `${process.env.MINIO_PUBLIC_URL}/${BUCKET_NAME}/${objectName}`;
+// Get R2 URL (public or signed)
+function getR2Url(key) {
+  // If you have R2 public URL configured, use it
+  if (R2_PUBLIC_URL) {
+    return `${R2_PUBLIC_URL}/${key}`;
   }
 
-  return `${protocol}://${endpoint}:${port}/${BUCKET_NAME}/${objectName}`;
+  // Otherwise, we'll generate signed URLs on-demand
+  return `/api/media/${encodeURIComponent(key)}`;
+}
+
+// Generate signed URL for private R2 objects
+async function getSignedR2Url(key, expiresIn = 3600) {
+  const command = new GetObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: key
+  });
+
+  return await getSignedUrl(r2Client, command, { expiresIn });
 }
 
 // Upload video endpoint
@@ -174,14 +157,15 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     const duration = metadata.format.duration;
 
     // Generate thumbnails
+    console.log('🎬 Generating thumbnails...');
     await generateThumbnails(tempVideoPath, tempThumbnailDir, 10);
 
-    // Upload video to MinIO
-    console.log('⬆️  Uploading video to MinIO...');
-    await uploadToMinio(tempVideoPath, `videos/${videoId}.mp4`, 'video/mp4');
+    // Upload video to R2
+    console.log('☁️  Uploading video to Cloudflare R2...');
+    await uploadToR2(tempVideoPath, `videos/${videoId}.mp4`, 'video/mp4');
 
-    // Upload thumbnails to MinIO
-    console.log('⬆️  Uploading thumbnails to MinIO...');
+    // Upload thumbnails to R2
+    console.log('🖼️  Uploading thumbnails to R2...');
     const thumbnailFiles = fs
       .readdirSync(tempThumbnailDir)
       .filter((f) => f.endsWith('.jpg'))
@@ -189,7 +173,7 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
 
     for (const thumbFile of thumbnailFiles) {
       const thumbPath = path.join(tempThumbnailDir, thumbFile);
-      await uploadToMinio(thumbPath, `thumbnails/${videoId}/${thumbFile}`, 'image/jpeg');
+      await uploadToR2(thumbPath, `thumbnails/${videoId}/${thumbFile}`, 'image/jpeg');
     }
 
     // Save to MongoDB
@@ -242,7 +226,7 @@ app.get('/api/videos', async (req, res) => {
     const videosWithThumbnails = videos.map((video) => ({
       ...video.toObject(),
       thumbnails: Array.from({ length: video.thumbnailCount }, (_, i) =>
-        getMinioUrl(`thumbnails/${video.videoId}/thumb_${i + 1}.jpg`)
+        getR2Url(`thumbnails/${video.videoId}/thumb_${i + 1}.jpg`)
       )
     }));
 
@@ -267,7 +251,7 @@ app.get('/api/videos/:videoId', async (req, res) => {
     await video.save();
 
     const thumbnails = Array.from({ length: video.thumbnailCount }, (_, i) =>
-      getMinioUrl(`thumbnails/${video.videoId}/thumb_${i + 1}.jpg`)
+      getR2Url(`thumbnails/${video.videoId}/thumb_${i + 1}.jpg`)
     );
 
     res.json({
@@ -282,7 +266,21 @@ app.get('/api/videos/:videoId', async (req, res) => {
   }
 });
 
-// Stream video from MinIO
+// Serve media from R2 (for private buckets without public URL)
+app.get('/api/media/:key(*)', async (req, res) => {
+  try {
+    const key = decodeURIComponent(req.params.key);
+
+    // Generate signed URL and redirect
+    const signedUrl = await getSignedR2Url(key, 3600);
+    res.redirect(signedUrl);
+  } catch (err) {
+    console.error('Media fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch media' });
+  }
+});
+
+// Stream video from R2
 app.get('/api/stream/:videoId', async (req, res) => {
   try {
     const video = await Video.findOne({ videoId: req.params.videoId });
@@ -291,59 +289,13 @@ app.get('/api/stream/:videoId', async (req, res) => {
       return res.status(404).json({ error: 'Video not found' });
     }
 
-    const objectName = `videos/${video.videoId}.mp4`;
+    const key = `videos/${video.videoId}.mp4`;
 
-    // Get object stats for file size
-    const stat = await minioClient.statObject(BUCKET_NAME, objectName);
-    const fileSize = stat.size;
+    // For R2, we'll use signed URLs which support range requests
+    const signedUrl = await getSignedR2Url(key, 3600);
 
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunksize = end - start + 1;
-
-      // Stream partial content from MinIO
-      const dataStream = await minioClient.getObject(BUCKET_NAME, objectName);
-
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunksize,
-        'Content-Type': 'video/mp4'
-      });
-
-      // Skip to start position and limit to end
-      let bytesRead = 0;
-      dataStream.on('data', (chunk) => {
-        if (bytesRead >= start && bytesRead < end) {
-          res.write(chunk);
-        }
-        bytesRead += chunk.length;
-        if (bytesRead >= end) {
-          dataStream.destroy();
-          res.end();
-        }
-      });
-
-      dataStream.on('end', () => res.end());
-      dataStream.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.status(500).end();
-      });
-    } else {
-      // Stream full video
-      const dataStream = await minioClient.getObject(BUCKET_NAME, objectName);
-
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Content-Type': 'video/mp4'
-      });
-
-      dataStream.pipe(res);
-    }
+    // Redirect to signed URL (R2 handles range requests)
+    res.redirect(signedUrl);
   } catch (err) {
     console.error('Stream error:', err);
     res.status(500).json({ error: 'Stream failed' });
@@ -354,13 +306,13 @@ app.get('/api/stream/:videoId', async (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
-    const minioBuckets = await minioClient.listBuckets();
 
     res.json({
       status: 'healthy',
       mongodb: mongoStatus,
-      minio: minioBuckets.length > 0 ? 'connected' : 'disconnected',
-      bucket: BUCKET_NAME
+      r2: 'configured',
+      bucket: BUCKET_NAME,
+      publicUrl: R2_PUBLIC_URL || 'using signed URLs'
     });
   } catch (err) {
     res.status(500).json({ status: 'unhealthy', error: err.message });
@@ -370,6 +322,6 @@ app.get('/health', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📊 MongoDB: ${MONGODB_URI}`);
-  console.log(`📦 MinIO: ${process.env.MINIO_ENDPOINT}:${process.env.MINIO_PORT}`);
-  console.log(`🪣 Bucket: ${BUCKET_NAME}`);
+  console.log(`☁️  Cloudflare R2 Bucket: ${BUCKET_NAME}`);
+  console.log(`🌐 Public URL: ${R2_PUBLIC_URL || 'Using signed URLs'}`);
 });

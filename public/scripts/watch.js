@@ -1,3 +1,4 @@
+// Auto-detect API URL (works locally and on Render)
 const API =
   window.location.hostname === 'localhost' ? 'http://localhost:3000' : window.location.origin;
 
@@ -77,7 +78,7 @@ async function loadVideo() {
             <div class="video-metadata">
               <div class="video-stats">
                 <span>${formatViews(video.views)} views</span>
-                <span>${formatDate(video.created_at)}</span>
+                <span>${formatDate(video.createdAt)}</span>
               </div>
             </div>
 
@@ -101,7 +102,7 @@ async function loadVideo() {
                   <div class="thumbnail-item" onclick="seekToTime(${thumbnailTimes[index].toFixed(
                     2
                   )})">
-                    <img src="${API}${thumb}" alt="Thumbnail ${index + 1}">
+                    <img src="${thumb}" alt="Thumbnail ${index + 1}">
                     <div class="thumbnail-time">${formatDuration(thumbnailTimes[index])}</div>
                   </div>
                 `

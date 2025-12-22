@@ -43,7 +43,7 @@ function startThumbnailPreview(videoId, thumbnails) {
 
   currentThumbnailIntervals[videoId] = setInterval(() => {
     currentIndex = (currentIndex + 1) % thumbnails.length;
-    img.src = `${API}${thumbnails[currentIndex]}`;
+    img.src = thumbnails[currentIndex];
   }, 800);
 }
 
@@ -55,7 +55,7 @@ function stopThumbnailPreview(videoId, firstThumbnail) {
 
   const img = document.querySelector(`[data-video-id="${videoId}"]`);
   if (img && firstThumbnail) {
-    img.src = `${API}${firstThumbnail}`;
+    img.src = firstThumbnail;
   }
 }
 
@@ -75,22 +75,22 @@ async function loadVideos() {
       .map(
         (video) => `
           <div class="video-card" 
-               onclick="openVideo('${video.video_id}')"
-               onmouseenter="startThumbnailPreview('${video.video_id}', ${JSON.stringify(
+               onclick="openVideo('${video.videoId}')"
+               onmouseenter="startThumbnailPreview('${video.videoId}', ${JSON.stringify(
           video.thumbnails
         ).replace(/"/g, '&quot;')})"
-               onmouseleave="stopThumbnailPreview('${video.video_id}', '${video.thumbnails[0]}')">
+               onmouseleave="stopThumbnailPreview('${video.videoId}', '${video.thumbnails[0]}')">
             <div class="thumbnail-container">
-              <img src="${API}${video.thumbnails[0]}" 
+              <img src="${video.thumbnails[0]}" 
                    alt="${video.title}" 
                    class="thumbnail"
-                   data-video-id="${video.video_id}">
+                   data-video-id="${video.videoId}">
               <div class="duration">${formatDuration(video.duration)}</div>
             </div>
             <div class="video-info">
               <div class="video-title">${video.title}</div>
               <div class="video-meta">
-                ${formatViews(video.views)} views • ${formatDate(video.created_at)}
+                ${formatViews(video.views)} views • ${formatDate(video.createdAt)}
               </div>
             </div>
           </div>
