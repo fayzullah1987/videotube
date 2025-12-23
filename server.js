@@ -66,7 +66,9 @@ const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL; // https://pub-xxxxx.r2.dev
 // Multer for temporary file storage
 const upload = multer({
   dest: 'uploads/videos',
-  limits: { fileSize: 500 * 1024 * 1024 }
+  limits: {
+    fileSize: 5 * 1024 * 1024 * 1024 // 5GB limit
+  }
 });
 
 // Get video metadata
@@ -98,18 +100,48 @@ function generateThumbnails(videoPath, outputDir, count = 10) {
   });
 }
 
-// Upload file to R2
+// Upload file to R2 with multipart support for large files
 async function uploadToR2(filePath, key, contentType) {
-  const fileContent = fs.readFileSync(filePath);
+  const fileStats = fs.statSync(filePath);
+  const fileSize = fileStats.size;
 
-  const command = new PutObjectCommand({
-    Bucket: BUCKET_NAME,
-    Key: key,
-    Body: fileContent,
-    ContentType: contentType
+  // For files under 100MB, use simple upload
+  if (fileSize < 100 * 1024 * 1024) {
+    const fileContent = fs.readFileSync(filePath);
+    const command = new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: fileContent,
+      ContentType: contentType
+    });
+    await r2Client.send(command);
+    return;
+  }
+
+  // For larger files, use multipart upload
+  const { Upload } = require('@aws-sdk/lib-storage');
+  const fileStream = fs.createReadStream(filePath);
+
+  const upload = new Upload({
+    client: r2Client,
+    params: {
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: fileStream,
+      ContentType: contentType
+    },
+    // Upload in 100MB chunks
+    partSize: 100 * 1024 * 1024,
+    queueSize: 4 // Upload 4 parts concurrently
   });
 
-  await r2Client.send(command);
+  upload.on('httpUploadProgress', (progress) => {
+    const percent = Math.round((progress.loaded / progress.total) * 100);
+    console.log(`   Uploading ${key}: ${percent}%`);
+  });
+
+  await upload.done();
+  console.log(`   ✅ ${key} uploaded successfully`);
 }
 
 // Get R2 URL (public or signed)

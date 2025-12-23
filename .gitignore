@@ -28,3 +28,6 @@ package-lock.json
 # Common files
 .Dockerfile
 .dockerignore
+
+thumbnails/*
+uploads/videos/*
